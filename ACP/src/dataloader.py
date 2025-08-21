@@ -16,7 +16,6 @@ class TimeSeriesDataset(Dataset):
         seq_len=336,
         label_len=0,
         pred_len=96,
-        enc_in=7,
     ):
         self.seq_len = seq_len
         self.label_len = label_len

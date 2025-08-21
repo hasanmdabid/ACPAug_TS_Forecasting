@@ -78,6 +78,7 @@ def train(
     seq_len,
     label_len,
     pred_len,
+    aug_type,
     segment_size=24,
     mix_rate=0.15,
     scale_factor=0.05,
@@ -92,7 +93,7 @@ def train(
     criterion = nn.MSELoss()
     aug = Augmentation()
     early_stopping = EarlyStopping(patience=patience, verbose=True)
-    path = "./checkpoints/Adaptive-Channel-Preserve"
+    path = f"./checkpoints/{aug_type}"
     if not os.path.exists(path):
         os.makedirs(path)
 
@@ -103,16 +104,28 @@ def train(
         for i, (batch_x, batch_y) in enumerate(train_loader):
             batch_x = batch_x.float().to(device)
             batch_y = batch_y.float().to(device)
-            xy = aug.adaptive_channel_preserve(
-                batch_x,
-                batch_y[:, -pred_len:, :],
-                segment_size=segment_size,
-                mix_rate=mix_rate,
-                scale_factor=scale_factor,
-                variance_threshold=variance_threshold,
-                corr_threshold=corr_threshold,
-                dim=1,
-            )
+            if aug_type == "Adaptive-Channel-Preserve":
+                xy = aug.adaptive_channel_preserve(
+                    batch_x,
+                    batch_y[:, -pred_len:, :],
+                    segment_size=segment_size,
+                    mix_rate=mix_rate,
+                    scale_factor=scale_factor,
+                    variance_threshold=variance_threshold,
+                    corr_threshold=corr_threshold,
+                    dim=1,
+                )
+            elif aug_type == "TFMix":
+                xy = aug.tf_mix(
+                    batch_x,
+                    batch_y[:, -pred_len:, :],
+                    segment_size=segment_size,
+                    mix_rate=mix_rate,
+                    scale_factor=scale_factor,
+                    variance_threshold=variance_threshold,
+                    corr_threshold=corr_threshold,
+                    dim=1,
+                )
             batch_x2, batch_y2 = (
                 xy[:, :seq_len, :],
                 xy[:, seq_len : seq_len + label_len + pred_len, :],

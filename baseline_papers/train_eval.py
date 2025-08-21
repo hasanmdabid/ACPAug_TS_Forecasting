@@ -1,9 +1,13 @@
 import torch
 import torch.nn as nn
+from torch.amp import GradScaler, autocast # type: ignore
+import torch.utils.checkpoint as checkpoint
 import numpy as np
 import os
 import time
+import gc
 from aug_methods import Augmentation
+from model import iTransformer
 
 
 # Metrics
@@ -90,6 +94,7 @@ def train(
 ):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
+    scaler = GradScaler("cuda")
     aug = Augmentation()
     early_stopping = EarlyStopping(patience=patience, verbose=True)
     path = f"./checkpoints/{aug_type}"
@@ -101,81 +106,178 @@ def train(
         train_loss = []
         epoch_time = time.time()
         for i, (batch_x, batch_y, aug_data) in enumerate(train_loader):
+            print(
+                f"Batch {i} - GPU memory allocated: {torch.cuda.memory_allocated(device)/1e9:.2f} GB"
+            )
             batch_x = batch_x.float().to(device)
             batch_y = batch_y.float().to(device)
-            if aug_type == "None":
-                pass
-            elif aug_type == "Freq-Mask":
-                xy = aug.freq_mask(
-                    batch_x, batch_y[:, -pred_len:, :], rate=aug_rate, dim=1
-                )
-                batch_x2, batch_y2 = (
-                    xy[:, :seq_len, :],
-                    xy[:, seq_len : seq_len + label_len + pred_len, :],
-                )
-                batch_x = torch.cat([batch_x, batch_x2], dim=0)
-                batch_y = torch.cat([batch_y, batch_y2], dim=0)
-            elif aug_type == "Freq-Mix":
-                xy = aug.freq_mix(
-                    batch_x, batch_y[:, -pred_len:, :], rate=aug_rate, dim=1
-                )
-                batch_x2, batch_y2 = (
-                    xy[:, :seq_len, :],
-                    xy[:, seq_len : seq_len + label_len + pred_len, :],
-                )
-                batch_x = torch.cat([batch_x, batch_x2], dim=0)
-                batch_y = torch.cat([batch_y, batch_y2], dim=0)
-            elif aug_type == "Wave-Mask":
-                xy = aug.wave_mask(
-                    batch_x,
-                    batch_y[:, -pred_len:, :],
-                    rates=rates,
-                    wavelet=wavelet,
-                    level=level,
-                    dim=1,
-                )
-                batch_x2, batch_y2 = (
-                    xy[:, :seq_len, :],
-                    xy[:, seq_len : seq_len + label_len + pred_len, :],
-                )
-                sampling_steps = int(batch_x2.shape[0] * sampling_rate)
-                indices = torch.randperm(batch_x2.shape[0])[:sampling_steps]
-                batch_x2, batch_y2 = batch_x2[indices, :, :], batch_y2[indices, :, :]
-                batch_x = torch.cat([batch_x, batch_x2], dim=0)
-                batch_y = torch.cat([batch_y, batch_y2], dim=0)
-            elif aug_type == "Wave-Mix":
-                xy = aug.wave_mix(
-                    batch_x,
-                    batch_y[:, -pred_len:, :],
-                    rates=rates,
-                    wavelet=wavelet,
-                    level=level,
-                    dim=1,
-                )
-                batch_x2, batch_y2 = (
-                    xy[:, :seq_len, :],
-                    xy[:, seq_len : seq_len + label_len + pred_len, :],
-                )
-                sampling_steps = int(batch_x2.shape[0] * sampling_rate)
-                indices = torch.randperm(batch_x2.shape[0])[:sampling_steps]
-                batch_x2, batch_y2 = batch_x2[indices, :, :], batch_y2[indices, :, :]
-                batch_x = torch.cat([batch_x, batch_x2], dim=0)
-                batch_y = torch.cat([batch_y, batch_y2], dim=0)
-            elif aug_type == "StAug":
-                aug_data = aug_data.float().to(device)
-                weighted_xy = aug.emd_aug(aug_data)
-                weighted_x, weighted_y = (
-                    weighted_xy[:, :seq_len, :],
-                    weighted_xy[:, seq_len : seq_len + label_len + pred_len, :],
-                )
-                batch_x, batch_y = aug.mix_aug(weighted_x, weighted_y, lambd=aug_rate)
+            aug_data = aug_data.float().to(device) if aug_data is not None else None
+
+            # Initialize variables for cleanup
+            xy = None
+            batch_x2 = None
+            batch_y2 = None
+            loss_aug = None
 
             optimizer.zero_grad()
-            outputs = model(batch_x)
-            loss = criterion(outputs[:, -pred_len:, :], batch_y[:, -pred_len:, :])
-            loss.backward()
-            optimizer.step()
+            with autocast(device_type="cuda"):
+                if aug_type == "None":
+                    if isinstance(model, iTransformer):
+                        # Apply input projection and positional encoding
+                        x = model.input_projection(batch_x)
+                        x = x + model.positional_encoding[:, : model.seq_len, :].to(
+                            x.device
+                        )
+                        # Checkpoint transformer layers
+                        outputs = checkpoint.checkpoint_sequential(
+                            model.transformer_encoder.layers,
+                            segments=2,
+                            input=x,
+                            use_reentrant=False,
+                        )
+                        outputs = model.output_projection(
+                            outputs.reshape(batch_x.size(0), -1)
+                        )
+                        outputs = outputs.view(batch_x.size(0), pred_len, model.enc_in)
+                    else:
+                        outputs = model(batch_x)
+                    loss = criterion(
+                        outputs[:, -pred_len:, :], batch_y[:, -pred_len:, :]
+                    )
+                else:
+                    # Original batch
+                    if isinstance(model, iTransformer):
+                        x = model.input_projection(batch_x)
+                        x = x + model.positional_encoding[:, : model.seq_len, :].to(
+                            x.device
+                        )
+                        outputs = checkpoint.checkpoint_sequential(
+                            model.transformer_encoder.layers,
+                            segments=2,
+                            input=x,
+                            use_reentrant=False,
+                        )
+                        outputs = model.output_projection(
+                            outputs.reshape(batch_x.size(0), -1)
+                        )
+                        outputs = outputs.view(batch_x.size(0), pred_len, model.enc_in)
+                    else:
+                        outputs = model(batch_x)
+                    loss = criterion(
+                        outputs[:, -pred_len:, :], batch_y[:, -pred_len:, :]
+                    )
+                    loss = loss / 2
+
+                    # Augmented batch
+                    if aug_type == "Freq-Mask":
+                        xy = aug.freq_mask(
+                            batch_x.cpu(),
+                            batch_y[:, -pred_len:, :].cpu(),
+                            rate=aug_rate,
+                            dim=1,
+                        )
+                        batch_x2, batch_y2 = (
+                            xy[:, :seq_len, :].to(device),
+                            xy[:, seq_len : seq_len + label_len + pred_len, :].to(
+                                device
+                            ),
+                        )
+                    elif aug_type == "Freq-Mix":
+                        xy = aug.freq_mix(
+                            batch_x.cpu(),
+                            batch_y[:, -pred_len:, :].cpu(),
+                            rate=aug_rate,
+                            dim=1,
+                        )
+                        batch_x2, batch_y2 = (
+                            xy[:, :seq_len, :].to(device),
+                            xy[:, seq_len : seq_len + label_len + pred_len, :].to(
+                                device
+                            ),
+                        )
+                    elif aug_type == "Wave-Mask":
+                        xy = aug.wave_mask(
+                            batch_x.cpu(),
+                            batch_y[:, -pred_len:, :].cpu(),
+                            rates=rates,
+                            wavelet=wavelet,
+                            level=level,
+                            dim=1,
+                        )
+                        sampling_steps = int(batch_x.shape[0] * sampling_rate)
+                        indices = torch.randperm(batch_x.shape[0])[:sampling_steps]
+                        batch_x2, batch_y2 = (
+                            xy[indices, :seq_len, :].to(device),
+                            xy[indices, seq_len : seq_len + label_len + pred_len, :].to(
+                                device
+                            ),
+                        )
+                    elif aug_type == "Wave-Mix":
+                        xy = aug.wave_mix(
+                            batch_x.cpu(),
+                            batch_y[:, -pred_len:, :].cpu(),
+                            rates=rates,
+                            wavelet=wavelet,
+                            level=level,
+                            dim=1,
+                        )
+                        sampling_steps = int(batch_x.shape[0] * sampling_rate)
+                        indices = torch.randperm(batch_x.shape[0])[:sampling_steps]
+                        batch_x2, batch_y2 = (
+                            xy[indices, :seq_len, :].to(device),
+                            xy[indices, seq_len : seq_len + label_len + pred_len, :].to(
+                                device
+                            ),
+                        )
+                    elif aug_type == "StAug":
+                        weighted_xy = aug.emd_aug(aug_data)  # type: ignore
+                        batch_x2, batch_y2 = aug.mix_aug(
+                            weighted_xy[:, :seq_len, :],
+                            weighted_xy[:, seq_len : seq_len + label_len + pred_len, :],
+                            lambd=aug_rate,
+                        )
+                    if isinstance(model, iTransformer):
+                        x = model.input_projection(batch_x2)
+                        x = x + model.positional_encoding[:, : model.seq_len, :].to(
+                            x.device
+                        )
+                        outputs = checkpoint.checkpoint_sequential(
+                            model.transformer_encoder.layers,
+                            segments=2,
+                            input=x,
+                            use_reentrant=False,
+                        )
+                        outputs = model.output_projection(
+                            outputs.reshape(batch_x2.size(0), -1) # type: ignore
+                        )
+                        outputs = outputs.view(batch_x2.size(0), pred_len, model.enc_in) # type: ignore
+                    else:
+                        outputs = model(batch_x2)
+                    loss_aug = criterion(
+                        outputs[:, -pred_len:, :], batch_y2[:, -pred_len:, :] # type: ignore
+                    )
+                    loss_aug = loss_aug / 2
+                    loss = loss + loss_aug
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
             train_loss.append(loss.item())
+
+            # Clean up variables to prevent memory leaks
+            del batch_x, batch_y, outputs, loss
+            if aug_type != "None":
+                if xy is not None:
+                    del xy
+                if batch_x2 is not None:
+                    del batch_x2
+                if batch_y2 is not None:
+                    del batch_y2
+                if loss_aug is not None:
+                    del loss_aug
+            torch.cuda.empty_cache()
+            gc.collect()
 
         train_loss = np.average(train_loss)
         val_loss = validate(model, val_loader, device, criterion, pred_len)
@@ -200,9 +302,29 @@ def validate(model, val_loader, device, criterion, pred_len):
         for batch_x, batch_y, _ in val_loader:
             batch_x = batch_x.float().to(device)
             batch_y = batch_y.float().to(device)
-            outputs = model(batch_x)
-            loss = criterion(outputs[:, -pred_len:, :], batch_y[:, -pred_len:, :])
+            with autocast(device_type="cuda"):
+                if isinstance(model, iTransformer):
+                    x = model.input_projection(batch_x)
+                    x = x + model.positional_encoding[:, : model.seq_len, :].to(
+                        x.device
+                    )
+                    outputs = checkpoint.checkpoint_sequential(
+                        model.transformer_encoder.layers,
+                        segments=2,
+                        input=x,
+                        use_reentrant=False,
+                    )
+                    outputs = model.output_projection(
+                        outputs.reshape(batch_x.size(0), -1)
+                    )
+                    outputs = outputs.view(batch_x.size(0), pred_len, model.enc_in)
+                else:
+                    outputs = model(batch_x)
+                loss = criterion(outputs[:, -pred_len:, :], batch_y[:, -pred_len:, :])
             total_loss.append(loss.item())
+            del batch_x, batch_y, outputs, loss
+            torch.cuda.empty_cache()
+            gc.collect()
     return np.average(total_loss)
 
 
@@ -213,11 +335,31 @@ def test(model, test_loader, device, scaler, pred_len):
         for batch_x, batch_y, _ in test_loader:
             batch_x = batch_x.float().to(device)
             batch_y = batch_y.float().to(device)
-            outputs = model(batch_x)
+            with autocast(device_type="cuda"):
+                if isinstance(model, iTransformer):
+                    x = model.input_projection(batch_x)
+                    x = x + model.positional_encoding[:, : model.seq_len, :].to(
+                        x.device
+                    )
+                    outputs = checkpoint.checkpoint_sequential(
+                        model.transformer_encoder.layers,
+                        segments=2,
+                        input=x,
+                        use_reentrant=False,
+                    )
+                    outputs = model.output_projection(
+                        outputs.reshape(batch_x.size(0), -1)
+                    )
+                    outputs = outputs.view(batch_x.size(0), pred_len, model.enc_in)
+                else:
+                    outputs = model(batch_x)
             outputs = outputs[:, -pred_len:, :].cpu().numpy()
             batch_y = batch_y[:, -pred_len:, :].cpu().numpy()
             preds.append(outputs)
             trues.append(batch_y)
+            del batch_x, batch_y, outputs
+            torch.cuda.empty_cache()
+            gc.collect()
 
     preds = np.concatenate(preds, axis=0)
     trues = np.concatenate(trues, axis=0)

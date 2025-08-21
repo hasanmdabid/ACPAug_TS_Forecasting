@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import os
 import random
 import time
-import json
+
 
 # Set random seed for reproducibility
 fix_seed = 2024

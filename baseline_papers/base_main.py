@@ -8,35 +8,40 @@ from train_eval import train, test
 from dataloader import TimeSeriesDataset
 from dataset_parameter import dataset_configs
 import gc
-import pandas as pd
+
+# setting device on GPU if available, else CPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+print()
+
 
 # Main experiment
 def main(epochs, learning_rate, patience, num_iterations, label_len):
-    # Common parameters
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if torch.cuda.is_available():
-        torch.cuda.set_per_process_memory_fraction(0.5)  # Limit to 50% of GPU memory
-    models = ["iTransformer"]
+    print("Starting main experiment...")
+    models = ["DLinear"]
 
     # Create directories
     if not os.path.exists("./checkpoints"):
         os.makedirs("./checkpoints")
     if not os.path.exists("./plots"):
         os.makedirs("./plots")
-    if not os.path.exists("./results"):
-        os.makedirs("./results")
 
     # Run experiments for each dataset
     for dataset_name, config in dataset_configs.items():
-        # Initialize results file with header
-        results_file = f"/home/abidhasan/Documnet/Project/a_c_p/baseline_papers/results/results_{dataset_name}.csv"
-        if not os.path.exists(results_file):
-            with open(results_file, "w") as f:
-                f.write(
-                    "Dataset,Model,Pred_Len,Aug_Type,Val_Loss,MAE,MSE,RSE,MAE_Std,MSE_Std,RSE_Std\n"
-                )
+        # Initialize per-iteration results CSV file
+        iteration_csv_path = f"/home/abidhasan/Documnet/Project/a_c_p/baseline_papers/results/iteration_results_{dataset_name}.csv"
+        with open(iteration_csv_path, "w") as f_iter:
+            f_iter.write(
+                "dataset,model,pred_len,aug_type,iteration,val_loss,mae,mse,rse\n"
+            )
 
-        results = {}
+        # Initialize average results CSV file
+        average_csv_path = f"/home/abidhasan/Documnet/Project/a_c_p/baseline_papers/results/average_results_{dataset_name}.csv"
+        with open(average_csv_path, "w") as f_avg:
+            f_avg.write(
+                "dataset,model,pred_len,aug_type,val_loss,mae,mse,rse,mae_std,mse_std,rse_std\n"
+            )
+
         for model_name in models:
             print(
                 f"\n=== Processing dataset: {dataset_name} with model: {model_name} ==="
@@ -99,9 +104,9 @@ def main(epochs, learning_rate, patience, num_iterations, label_len):
                 # Run experiments for each augmentation type
                 for aug_type in config["aug_types"]:
                     params = config["aug_params"][pred_len][aug_type]
-                    mse_list, mae_list, rse_list = [], [], []
+                    mse_list, mae_list, rse_list, val_loss_list = [], [], [], []
                     print(
-                        f"\nRunning experiment with {model_name} model, {aug_type} augmentation for {dataset_name}, pred_len={pred_len}..."
+                        f"\nRunning experiment with {aug_type} augmentation for {dataset_name}, pred_len={pred_len}..."
                     )
                     for itr in range(num_iterations):
                         print(f"Iteration {itr+1}/{num_iterations}")
@@ -151,57 +156,31 @@ def main(epochs, learning_rate, patience, num_iterations, label_len):
                         mse_list.append(mse)
                         mae_list.append(mae)
                         rse_list.append(rse)
+                        val_loss_list.append(val_loss)
                         print(
                             f"Iteration {itr+1} - Val Loss: {val_loss:.6f}, MAE: {mae:.6f}, MSE: {mse:.6f}, RSE: {rse:.6f}"
                         )
 
-                    results[(pred_len, aug_type)] = {
-                        "val_loss": np.mean(
-                            [
-                                train(
-                                    model,
-                                    train_loader,
-                                    val_loader,
-                                    device,
-                                    aug_type,
-                                    config["seq_len"],
-                                    label_len,
-                                    pred_len,
-                                    aug_rate=params["aug_rate"],
-                                    rates=params["rates"],
-                                    wavelet=params["wavelet"],
-                                    level=params["level"],
-                                    sampling_rate=params["sampling_rate"],
-                                    n_imf=params["n_imf"],
-                                    epochs=epochs,
-                                    lr=learning_rate,
-                                    patience=patience,
-                                )
-                                for _ in range(num_iterations)
-                            ]
-                        ),
-                        "mae": np.mean(mae_list),
-                        "mse": np.mean(mse_list),
-                        "rse": np.mean(rse_list),
-                        "mae_std": np.std(mae_list),
-                        "mse_std": np.std(mse_list),
-                        "rse_std": np.std(rse_list),
-                    }
-                    print(
-                        f'{aug_type} - Avg Val Loss: {results[(pred_len, aug_type)]["val_loss"]:.6f}, Avg MAE: {results[(pred_len, aug_type)]["mae"]:.6f}, '
-                        f'Avg MSE: {results[(pred_len, aug_type)]["mse"]:.6f}, Avg RSE: {results[(pred_len, aug_type)]["rse"]:.6f}, '
-                        f'MSE Std: {results[(pred_len, aug_type)]["mse_std"]:.6f}'
-                    )
+                        # Save iteration metrics to iteration_results CSV
+                        with open(iteration_csv_path, "a") as f_iter:
+                            f_iter.write(
+                                f"{dataset_name},{model_name},{pred_len},{aug_type},{itr+1},"
+                                f"{val_loss:.6f},{mae:.6f},{mse:.6f},{rse:.6f}\n"
+                            )
 
-                    # Save results after each experiment
-                    metrics = results[(pred_len, aug_type)]
-                    with open(results_file, "a") as f:
-                        f.write(
+                    # Save average and standard deviation metrics to average_results CSV
+                    with open(average_csv_path, "a") as f_avg:
+                        f_avg.write(
                             f"{dataset_name},{model_name},{pred_len},{aug_type},"
-                            f'{metrics["val_loss"]:.6f},{metrics["mae"]:.6f},{metrics["mse"]:.6f},'
-                            f'{metrics["rse"]:.6f},{metrics["mae_std"]:.6f},{metrics["mse_std"]:.6f},'
-                            f'{metrics["rse_std"]:.6f}\n'
+                            f"{np.mean(val_loss_list):.6f},{np.mean(mae_list):.6f},{np.mean(mse_list):.6f},"
+                            f"{np.mean(rse_list):.6f},{np.std(mae_list):.6f},{np.std(mse_list):.6f},{np.std(rse_list):.6f}\n"
                         )
+
+                    print(
+                        f"{aug_type} - Avg Val Loss: {np.mean(val_loss_list):.6f}, Avg MAE: {np.mean(mae_list):.6f}, "
+                        f"Avg MSE: {np.mean(mse_list):.6f}, Avg RSE: {np.mean(rse_list):.6f}, "
+                        f"MAE Std: {np.std(mae_list):.6f}, MSE Std: {np.std(mse_list):.6f}, RSE Std: {np.std(rse_list):.6f}"
+                    )
 
                     # Plot predictions
                     model.load_state_dict(
@@ -242,6 +221,7 @@ def main(epochs, learning_rate, patience, num_iterations, label_len):
                 gc.collect()
 
     print("All experiments completed.")
+
 
 if __name__ == "__main__":
     main(epochs=30, learning_rate=0.01, patience=10, num_iterations=5, label_len=0)
