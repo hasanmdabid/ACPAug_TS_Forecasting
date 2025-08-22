@@ -2,6 +2,7 @@ import torch
 from torch.utils.data import DataLoader
 import numpy as np
 import pandas as pd
+
 import matplotlib.pyplot as plt
 import os
 from src.dataloader import TimeSeriesDataset
@@ -10,13 +11,11 @@ from src.dataset_parameter import dataset_configs
 from src.train_eval import train, validate, test
 import gc
 
-# setting device on GPU if available, else CPU
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
-print()  # setting device on GPU if available, else CPU
+# Setting device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 print()
+
 epochs = 30
 learning_rate = 0.01
 patience = 10
@@ -28,12 +27,10 @@ def main():
     models = ["DLinear"]
 
     # Create directories
-    if not os.path.exists("./checkpoints"):
-        os.makedirs("./checkpoints")
-    if not os.path.exists("./plots"):
-        os.makedirs("./plots")
+    os.makedirs("./checkpoints", exist_ok=True)
+    os.makedirs("./plots", exist_ok=True)
+    os.makedirs("/home/abidhasan/Documnet/Project/a_c_p/ACP/results", exist_ok=True)
 
-    # Run experiments for each dataset
     # Run experiments for each dataset
     for dataset_name, config in dataset_configs.items():
         # Initialize per-iteration results CSV file
@@ -51,7 +48,9 @@ def main():
             )
 
         for model_name in models:
-            print(f"\n=== Processing dataset: {dataset_name} with model: {model_name} ===")
+            print(
+                f"\n=== Processing dataset: {dataset_name} with model: {model_name} ==="
+            )
 
             # Load datasets
             for pred_len in config["pred_lens"]:
@@ -63,7 +62,6 @@ def main():
                     seq_len=config["seq_len"],
                     label_len=label_len,
                     pred_len=pred_len,
-                    
                 )
                 val_dataset = TimeSeriesDataset(
                     data_path=config["data_path"],
@@ -100,7 +98,7 @@ def main():
                     drop_last=True,
                 )
 
-                # Run experiment for Adaptive-Channel-Preserve
+                # Run experiment for each augmentation
                 for aug_type in config["aug_types"]:
                     params = config["aug_params"][pred_len][aug_type]
                     mse_list, mae_list, rse_list, val_loss_list = [], [], [], []
@@ -123,19 +121,16 @@ def main():
                             config["seq_len"],
                             label_len,
                             pred_len,
-                            aug_type,
-                            segment_size=params["segment_size"],
-                            mix_rate=params["mix_rate"],
-                            scale_factor=params["scale_factor"],
-                            variance_threshold=params["variance_threshold"],
-                            corr_threshold=params["corr_threshold"],
-                            sampling_rate=params["sampling_rate"],
+                            aug_type=aug_type,
+                            aug_params=params,
                             epochs=epochs,
                             lr=learning_rate,
                             patience=patience,
                         )
+                        checkpoint_dir = f"./checkpoints/{aug_type}"
+                        os.makedirs(checkpoint_dir, exist_ok=True)
                         model.load_state_dict(
-                            torch.load(f"./checkpoints/{aug_type}/checkpoint.pth")
+                            torch.load(f"{checkpoint_dir}/checkpoint.pth")
                         )
                         mae, mse, rse = test(
                             model, test_loader, device, train_dataset.scaler, pred_len
@@ -170,7 +165,7 @@ def main():
 
                     # Plot predictions
                     model.load_state_dict(
-                        torch.load(f"./checkpoints/{aug_type}/checkpoint.pth")
+                        torch.load(f"{checkpoint_dir}/checkpoint.pth")
                     )
                     model.eval()
                     with torch.no_grad():
@@ -206,6 +201,8 @@ def main():
                 gc.collect()
 
     print("All experiments completed.")
+    print("Results saved in /home/abidhasan/Documnet/Project/a_c_p/ACP/results/")
+    print("Plots saved in ./plots/")
 
 
 # Main experiment

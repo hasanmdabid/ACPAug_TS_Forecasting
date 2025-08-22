@@ -1,11 +1,30 @@
 import torch
 import torch.nn as nn
+from torch.amp import GradScaler, autocast # type:ignore
 import numpy as np
 import os
 import time
-from src.aug_method import Augmentation
+import gc
+from aug_method import Augmentation
+from model import DLinear
 
 
+# Metrics
+def RSE(pred, true):
+    return np.sqrt(np.sum((true - pred) ** 2)) / np.sqrt(
+        np.sum((true - true.mean()) ** 2)
+    )
+
+
+def MAE(pred, true):
+    return np.mean(np.abs(pred - true))
+
+
+def MSE(pred, true):
+    return np.mean((pred - true) ** 2)
+
+
+# Early Stopping class
 class EarlyStopping:
     def __init__(self, patience=7, verbose=False, delta=0):
         self.patience = patience
@@ -43,27 +62,14 @@ class EarlyStopping:
         return self.val_loss_min
 
 
+# Learning rate adjustment
 def adjust_learning_rate(optimizer, epoch, lr):
     lr_adjust = {epoch: lr * (0.5 ** ((epoch - 1) // 1))}
     if epoch in lr_adjust:
         lr = lr_adjust[epoch]
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
-        print(f"Adjusted learning rate to {lr}")
-
-
-def RSE(pred, true):
-    return np.sqrt(np.sum((true - pred) ** 2)) / np.sqrt(
-        np.sum((true - true.mean()) ** 2)
-    )
-
-
-def MAE(pred, true):
-    return np.mean(np.abs(pred - true))
-
-
-def MSE(pred, true):
-    return np.mean((pred - true) ** 2)
+        print(f"Updating learning rate to {lr}")
 
 
 def train(
@@ -71,71 +77,83 @@ def train(
     train_loader,
     val_loader,
     device,
+    aug_type,
     seq_len,
     label_len,
     pred_len,
-    aug_type,
-    aug_params,
-    epochs=10,
+    aug_rate=0.3,
+    wavelet="db2",
+    level=3,
+    sampling_rate=0.2,
+    epochs=30,
     lr=0.01,
-    patience=3,
+    patience=12,
 ):
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
+    scaler = GradScaler("cuda")
     aug = Augmentation()
     early_stopping = EarlyStopping(patience=patience, verbose=True)
     path = f"./checkpoints/{aug_type}"
     if not os.path.exists(path):
         os.makedirs(path)
 
-    sampling_rate = aug_params.get("sampling_rate", 0.5)
-    aug_params_clean = {k: v for k, v in aug_params.items() if k != "sampling_rate"}
-
     for epoch in range(epochs):
         model.train()
         train_loss = []
         epoch_time = time.time()
-        for i, (batch_x, batch_y) in enumerate(train_loader):
+        for i, (batch_x, batch_y, aug_data) in enumerate(train_loader):
+            print(
+                f"Batch {i} - GPU memory allocated: {torch.cuda.memory_allocated(device)/1e9:.2f} GB"
+            )
             batch_x = batch_x.float().to(device)
             batch_y = batch_y.float().to(device)
-            if aug_type == "Adaptive-Channel-Preserve":
-                augmented_data = aug.adaptive_channel_preserve(
-                    batch_x, batch_y[:, -pred_len:, :], **aug_params_clean
-                )
-            elif aug_type == "TFMix":
-                augmented_data = aug.tf_mix(
-                    batch_x, batch_y[:, -pred_len:, :], **aug_params_clean
-                )
-            elif aug_type == "STL-Mix":
-                augmented_data = aug.stl_mix(
-                    batch_x,
-                    batch_y[:, -pred_len:, :],
-                    device=device,
-                    **aug_params_clean,
-                )
-            elif aug_type == "VMD-Mix":
-                augmented_data = aug.vmd_mix(
-                    batch_x,
-                    batch_y[:, -pred_len:, :],
-                    device=device,
-                    **aug_params_clean,
-                )
-            batch_x2, batch_y2 = (
-                augmented_data[:, :seq_len, :],
-                augmented_data[:, seq_len : seq_len + label_len + pred_len, :],
-            )
-            sampling_steps = int(batch_x2.shape[0] * sampling_rate)
-            indices = torch.randperm(batch_x2.shape[0], device=device)[:sampling_steps]
-            batch_x2, batch_y2 = batch_x2[indices, :, :], batch_y2[indices, :, :]
-            batch_x = torch.cat([batch_x, batch_x2], dim=0)
-            batch_y = torch.cat([batch_y, batch_y2], dim=0)
+            aug_data = aug_data.float().to(device) if aug_data is not None else None
 
             optimizer.zero_grad()
-            outputs = model(batch_x)
-            loss = criterion(outputs[:, -pred_len:, :], batch_y[:, -pred_len:, :])
-            loss.backward()
-            optimizer.step()
+            with autocast(device_type="cuda"):
+                # Original batch
+                outputs = model(batch_x)
+                loss = criterion(outputs[:, -pred_len:, :], batch_y[:, -pred_len:, :])
+
+                # Augmented batch for Wave-Freq
+                if aug_type == "Wave-Freq":
+                    loss = loss / 2
+                    xy = aug.wave_freq_aug(
+                        batch_x.cpu(),
+                        batch_y[:, -pred_len:, :].cpu(),
+                        mask_rate=aug_rate,
+                        wavelet=wavelet,
+                        level=level,
+                        lambd=None,
+                        dim=1,
+                    )
+                    sampling_steps = int(batch_x.shape[0] * sampling_rate)
+                    indices = torch.randperm(batch_x.shape[0])[:sampling_steps]
+                    batch_x2, batch_y2 = (
+                        xy[indices, :seq_len, :].to(device),
+                        xy[indices, seq_len : seq_len + label_len + pred_len, :].to(
+                            device
+                        ),
+                    )
+                    outputs = model(batch_x2)
+                    loss_aug = criterion(
+                        outputs[:, -pred_len:, :], batch_y2[:, -pred_len:, :]
+                    )
+                    loss_aug = loss_aug / 2
+                    loss = loss + loss_aug
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
             train_loss.append(loss.item())
+
+            del batch_x, batch_y, outputs, loss
+            if aug_type == "Wave-Freq":
+                del xy, batch_x2, batch_y2, loss_aug
+            torch.cuda.empty_cache()
+            gc.collect()
 
         train_loss = np.average(train_loss)
         val_loss = validate(model, val_loader, device, criterion, pred_len)
@@ -157,12 +175,16 @@ def validate(model, val_loader, device, criterion, pred_len):
     model.eval()
     total_loss = []
     with torch.no_grad():
-        for batch_x, batch_y in val_loader:
+        for batch_x, batch_y, _ in val_loader:
             batch_x = batch_x.float().to(device)
             batch_y = batch_y.float().to(device)
-            outputs = model(batch_x)
-            loss = criterion(outputs[:, -pred_len:, :], batch_y[:, -pred_len:, :])
+            with autocast(device_type="cuda"):
+                outputs = model(batch_x)
+                loss = criterion(outputs[:, -pred_len:, :], batch_y[:, -pred_len:, :])
             total_loss.append(loss.item())
+            del batch_x, batch_y, outputs, loss
+            torch.cuda.empty_cache()
+            gc.collect()
     return np.average(total_loss)
 
 
@@ -170,14 +192,18 @@ def test(model, test_loader, device, scaler, pred_len):
     model.eval()
     preds, trues = [], []
     with torch.no_grad():
-        for batch_x, batch_y in test_loader:
+        for batch_x, batch_y, _ in test_loader:
             batch_x = batch_x.float().to(device)
             batch_y = batch_y.float().to(device)
-            outputs = model(batch_x)
+            with autocast(device_type="cuda"):
+                outputs = model(batch_x)
             outputs = outputs[:, -pred_len:, :].cpu().numpy()
             batch_y = batch_y[:, -pred_len:, :].cpu().numpy()
             preds.append(outputs)
             trues.append(batch_y)
+            del batch_x, batch_y, outputs
+            torch.cuda.empty_cache()
+            gc.collect()
 
     preds = np.concatenate(preds, axis=0)
     trues = np.concatenate(trues, axis=0)
